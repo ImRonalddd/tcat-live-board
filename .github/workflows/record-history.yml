@@ -1,0 +1,37 @@
+name: Record TCAT history
+
+# The TCAT API keeps actual departure times for only about 15 minutes,
+# so this records a snapshot every 10 minutes into the data branch.
+on:
+  schedule:
+    - cron: "4-59/10 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-history
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: data
+          path: data
+      - name: Record a snapshot
+        run: python3 collector/collect.py data/history
+      - name: Save to the data branch
+        working-directory: data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -q -m "chore: record TCAT history $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push -q origin HEAD:data

@@ -95,6 +95,9 @@ td.empty { color: var(--muted); text-align: center; padding: 16px; }
 .bar .track { display: block; background: var(--soft); border-radius: 3px; height: 12px; overflow: hidden; }
 .bar .fill { display: block; height: 100%; background: var(--accent); border-radius: 3px; }
 .trend svg { display: block; width: 100%; }
+.hblocks { grid-template-columns: repeat(auto-fit, minmax(min(100%, 230px), 1fr)); }
+.hcard { text-align: left; width: 100%; cursor: pointer; }
+button[aria-pressed="true"] { border-color: var(--accent); background: var(--info-bg); }
 .kv { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; font-size: 12.5px; margin: 0; }
 .kv dt { color: var(--muted); }
 .kv dd { margin: 0; overflow-wrap: anywhere; }
@@ -156,6 +159,7 @@ footer { margin-top: 20px; }
   <section class="tab" id="tab-stops" role="tabpanel" hidden></section>
   <section class="tab" id="tab-routes" role="tabpanel" hidden></section>
   <section class="tab" id="tab-alerts" role="tabpanel" hidden></section>
+  <section class="tab" id="tab-history" role="tabpanel" hidden></section>
   <section class="tab" id="tab-predictions" role="tabpanel" hidden></section>
   <section class="tab" id="tab-schedule" role="tabpanel" hidden></section>
   <section class="tab" id="tab-signs" role="tabpanel" hidden></section>
@@ -199,6 +203,7 @@ const S = {
   history: [], trails: new Map(),
   gtfs: null, gtfsError: null, gtfsFile: 'stop_times.txt', swagger: null, kmlLines: [], kmlLoaded: false,
   explorer: { key: null, params: {}, result: null },
+  hist: { index: null, days: new Map(), day: null, block: 'all', error: null, at: 0 },
 };
 
 // Values this dashboard never shows: a leaked Bitly key, sign MAC and IP addresses.
@@ -917,6 +922,7 @@ function renderKpis() {
   tc('predictions', S.tu.length);
   tc('routes', S.routes.length);
   tc('signs', S.signs.length);
+  tc('history', S.hist.index?.days?.length || 0);
 }
 
 // ---------- Buses ----------
@@ -1466,9 +1472,165 @@ function renderExplorer() {
     <div id="exout" class="panel gap">${exResult()}</div>`;
 }
 
+// ---------- History (recorded every 10 minutes by the GitHub Action in this repo) ----------
+const HISTORY = 'https://raw.githubusercontent.com/ImRonalddd/tcat-live-board/data/history';
+const BLOCKS = [['0', '12 AM to 6 AM'], ['6', '6 AM to 12 PM'], ['12', '12 PM to 6 PM'], ['18', '6 PM to 12 AM']];
+const RUNS_PER_BLOCK = 36;
+async function loadHistoryDay(date) {
+  try { S.hist.days.set(date, await get(`${HISTORY}/${date}.json`, 'json', 'History day')); }
+  catch (e) { S.hist.error = e.message; }
+}
+async function loadHistory() {
+  try {
+    S.hist.index = await get(`${HISTORY}/index.json`, 'json', 'History index');
+    S.hist.error = null;
+  } catch (e) { S.hist.error = e.message; }
+  S.hist.at = Date.now();
+  const days = S.hist.index?.days || [];
+  if (days.length && !days.some(d => d.date === S.hist.day)) S.hist.day = days[days.length - 1].date;
+  if (S.hist.day) await loadHistoryDay(S.hist.day);
+  renderKpis();
+  rerender(['history']);
+}
+async function selectHistoryDay(date) {
+  S.hist.day = date;
+  renderTab();
+  if (!S.hist.days.has(date)) { await loadHistoryDay(date); rerender(['history']); }
+}
+const histBlank = () => ({
+  v: { n: 0, late: 0, early: 0, devSum: 0, devMax: 0, onSum: 0, onMax: 0, capSum: 0, loadMax: 0, occ: [0, 0, 0, 0, 0, 0, 0] },
+  d: { n: 0, onTime: 0, late: 0, early: 0, delaySum: 0, delayMax: 0 },
+  trips: new Set(),
+});
+function histMerge(into, s) {
+  for (const k of ['n', 'late', 'early', 'devSum', 'onSum', 'capSum']) into.v[k] += s.v?.[k] || 0;
+  for (const k of ['devMax', 'onMax', 'loadMax']) into.v[k] = Math.max(into.v[k], s.v?.[k] || 0);
+  (s.v?.occ || []).forEach((n, i) => { into.v.occ[i] += n; });
+  for (const k of ['n', 'onTime', 'late', 'early', 'delaySum']) into.d[k] += s.d?.[k] || 0;
+  into.d.delayMax = Math.max(into.d.delayMax, s.d?.delayMax || 0);
+  for (const t of s.trips || []) into.trips.add(t);
+}
+function histAgg(day, names) {
+  const out = { all: histBlank(), routes: new Map(), runs: 0, busSum: 0, busMax: 0 };
+  for (const name of names) {
+    const b = day?.blocks?.[name];
+    if (!b) continue;
+    out.runs += b.runs;
+    out.busSum += b.busSum;
+    out.busMax = Math.max(out.busMax, b.busMax);
+    for (const [rid, s] of Object.entries(b.routes)) {
+      if (!out.routes.has(rid)) out.routes.set(rid, histBlank());
+      histMerge(out.routes.get(rid), s);
+      histMerge(out.all, s);
+    }
+  }
+  return out;
+}
+// Scheduled trips per route and 6-hour block on a calendar date, by trip start time.
+// Trips that start after midnight belong to the previous day's service.
+function scheduledTrips(date) {
+  const G = S.gtfs;
+  if (!G) return null;
+  G._sched = G._sched || new Map();
+  if (G._sched.has(date)) return G._sched.get(date);
+  const out = new Map();
+  const add = (rid, sec) => { const b = String(Math.floor(sec / 21600) * 6); const m = out.get(rid) || {}; m[b] = (m[b] || 0) + 1; out.set(rid, m); };
+  const [y, mo, d] = date.split('-').map(Number);
+  const on = new Date(Date.UTC(y, mo - 1, d)), before = new Date(on.getTime() - 86400000);
+  const asDay = dt => ({ ymd: dt.toISOString().slice(0, 10).replace(/-/g, ''), dow: dt.getUTCDay() });
+  const today = activeServices(asDay(on)), yesterday = activeServices(asDay(before));
+  if (!today.size) { G._sched.set(date, null); return null; } // the loaded GTFS feed does not cover this day
+  for (const t of G.trips.values()) {
+    const start = G.byTrip.get(t.trip_id)?.[0]?.dep;
+    if (start == null) continue;
+    if (today.has(t.service_id) && start < 86400) add(t.route_id, start);
+    if (yesterday.has(t.service_id) && start >= 86400) add(t.route_id, start - 86400);
+  }
+  G._sched.set(date, out);
+  return out;
+}
+const dayLabel = date => { const [y, m, d] = date.split('-').map(Number); return new Intl.DateTimeFormat('en-US', { timeZone: 'UTC', weekday: 'short', month: 'short', day: 'numeric' }).format(Date.UTC(y, m - 1, d)); };
+const share = (a, b) => b ? `${Math.round(100 * a / b)}%` : '';
+function renderHistory() {
+  const sec = $('#tab-history');
+  const days = S.hist.index?.days || [];
+  if (!days.length) {
+    sec.innerHTML = `<div class="panel"><h2>History</h2><p class="${S.hist.error ? 'err' : 'muted'}">${S.hist.error ? `No history yet. The recorder has not saved any data, or it could not be reached: ${esc(S.hist.error)}` : 'Loading history…'}</p></div>`;
+    return;
+  }
+  const date = S.hist.day, day = S.hist.days.get(date);
+  const sched = scheduledTrips(date);
+  const schedFor = (rid, names) => sched ? names.reduce((n, b) => n + (sched.get(String(rid))?.[b] || 0), 0) : null;
+  const schedAll = names => sched ? [...sched.keys()].reduce((n, rid) => n + schedFor(rid, names), 0) : null;
+  const card = ([name, label]) => {
+    const a = histAgg(day, [name]), d = a.all.d, v = a.all.v;
+    const sch = schedAll([name]);
+    const tone = !d.n ? '' : d.onTime / d.n >= 0.8 ? 'good' : d.onTime / d.n >= 0.6 ? 'warn' : 'bad';
+    return `<button type="button" class="panel kpi hcard" data-act="hblock" data-id="${name}" aria-pressed="${S.hist.block === name}">
+      <div class="l">${esc(label)}</div>
+      <div class="v">${d.n ? `<span class="pill ${tone}" style="font-size:18px">${share(d.onTime, d.n)} on time</span>` : '<span class="muted">No data</span>'}</div>
+      <dl class="kv" style="margin-top:6px">
+        <dt>Departures</dt><dd>${d.n} measured${d.n ? ` · average ${esc(fmtDelay(Math.round(d.delaySum / d.n)))}` : ''}</dd>
+        <dt>Buses</dt><dd>${a.runs ? `${(a.busSum / a.runs).toFixed(1)} average · ${a.busMax} max` : 'none recorded'}</dd>
+        <dt>Late buses</dt><dd>${v.n ? `${share(v.late, v.n)} of samples` : ''}</dd>
+        <dt>Riders per bus</dt><dd>${v.n ? `${(v.onSum / v.n).toFixed(1)} · max load ${Math.round(100 * v.loadMax)}%` : ''}</dd>
+        <dt>Trips run</dt><dd>${a.all.trips.size} seen${sch != null ? ` of ${sch} scheduled` : ''}</dd>
+        <dt>Coverage</dt><dd>${a.runs} of ${RUNS_PER_BLOCK} snapshots</dd>
+      </dl></button>`;
+  };
+  const names = S.hist.block === 'all' ? BLOCKS.map(b => b[0]) : [S.hist.block];
+  const agg = histAgg(day, names);
+  const rows = [...agg.routes].map(([rid, s]) => ({ rid, s, sched: schedFor(rid, names) }));
+  if (sched) for (const [rid] of sched) if (!agg.routes.has(rid) && schedFor(rid, names)) rows.push({ rid, s: histBlank(), sched: schedFor(rid, names) });
+  const cols = [
+    { h: 'Route', k: r => route(r.rid)?.SortOrder ?? 999, f: r => chip(r.rid) },
+    { h: 'On time', k: r => r.s.d.n ? r.s.d.onTime / r.s.d.n : null, f: r => share(r.s.d.onTime, r.s.d.n), c: 'num' },
+    { h: 'Departures', k: r => r.s.d.n, c: 'num' },
+    { h: 'Early', k: r => r.s.d.early, c: 'num' },
+    { h: 'Late', k: r => r.s.d.late, c: 'num' },
+    { h: 'Average delay', k: r => r.s.d.n ? r.s.d.delaySum / r.s.d.n : null, f: r => r.s.d.n ? esc(fmtDelay(Math.round(r.s.d.delaySum / r.s.d.n))) : '' },
+    { h: 'Worst delay', k: r => r.s.d.n ? r.s.d.delayMax : null, f: r => r.s.d.n ? esc(fmtDelay(r.s.d.delayMax)) : '' },
+    { h: 'Late bus samples', k: r => r.s.v.n ? r.s.v.late / r.s.v.n : null, f: r => share(r.s.v.late, r.s.v.n), c: 'num' },
+    { h: 'Riders per bus', k: r => r.s.v.n ? r.s.v.onSum / r.s.v.n : null, f: r => r.s.v.n ? (r.s.v.onSum / r.s.v.n).toFixed(1) : '', c: 'num' },
+    { h: 'Most riders', k: r => r.s.v.onMax, c: 'num' },
+    { h: 'Max load', k: r => r.s.v.loadMax, f: r => r.s.v.n ? `${Math.round(100 * r.s.v.loadMax)}%` : '', c: 'num' },
+    { h: 'Trips seen', k: r => r.s.trips.size, c: 'num' },
+    { h: 'Trips scheduled', k: r => r.sched, c: 'num' },
+  ];
+  const trendCols = [
+    { h: 'Day', k: 'date', f: x => `${esc(dayLabel(x.date))}${x.date === date ? ' <span class="pill info">shown</span>' : ''}` },
+    { h: 'On time', k: 'onTime', f: x => x.onTime == null ? '' : `${Math.round(100 * x.onTime)}%`, c: 'num' },
+    { h: 'Departures', k: 'departures', c: 'num' },
+    { h: 'Average delay', k: 'avgDelay', f: x => x.avgDelay == null ? '' : esc(fmtDelay(x.avgDelay)) },
+    { h: 'Buses', k: 'busAvg', c: 'num' },
+    { h: 'Late bus samples', k: 'lateShare', f: x => x.lateShare == null ? '' : `${Math.round(100 * x.lateShare)}%`, c: 'num' },
+    { h: 'Riders per bus', k: 'ridersAvg', c: 'num' },
+    { h: 'Trips seen', k: 'trips', c: 'num' },
+    { h: 'Alerts', k: 'alerts', c: 'num' },
+    { h: 'Snapshots', k: 'runs', c: 'num' },
+  ];
+  const alerts = Object.entries(day?.alerts || {}).sort((a, b) => a[1].first - b[1].first);
+  const otp = days.filter(x => x.onTime != null);
+  sec.innerHTML = `
+    <div class="panel"><div class="row"><h2 style="margin:0">History</h2>
+      <label for="hday" class="small">Day</label><select id="hday">${[...days].reverse().map(x => `<option value="${esc(x.date)}"${x.date === date ? ' selected' : ''}>${esc(dayLabel(x.date))}</option>`).join('')}</select>
+      <span class="note">Updated ${esc(ago(S.hist.index?.updated))}</span></div>
+      <p class="note">A GitHub Action records TCAT every 10 minutes, starting ${esc(dayLabel(days[0].date))}. On time means a bus left a timepoint no more than 1 minute early or 5 minutes late. Rider numbers come from on-board passenger counts. Trips seen counts trips that left at least one timepoint while the recorder was running.</p></div>
+    ${day ? `<div class="grid2 gap hblocks">${BLOCKS.map(card).join('')}</div>
+    <div class="panel gap"><div class="row"><h2 style="margin:0">By route</h2>
+      <button type="button" data-act="hblock" data-id="all" aria-pressed="${S.hist.block === 'all'}">Whole day</button>
+      ${BLOCKS.map(([n, l]) => `<button type="button" data-act="hblock" data-id="${n}" aria-pressed="${S.hist.block === n}">${esc(l)}</button>`).join('')}</div>
+      <p class="note">${esc(dayLabel(date))}, ${S.hist.block === 'all' ? 'whole day' : esc(BLOCKS.find(b => b[0] === S.hist.block)[1])}: ${share(agg.all.d.onTime, agg.all.d.n) || 'no'} on time across ${agg.all.d.n} timepoint departures.</p>
+      ${table('hroutes', rows, cols, { sort: 0, empty: 'No data for this block.' })}</div>
+    <div class="panel gap"><h2>Alerts in effect · ${alerts.length}</h2>${alerts.length ? `<div class="stack" style="gap:8px">${alerts.map(([id, a]) => `<div><div class="row"><span class="pill">${esc(a.cause)}</span><span class="pill">${esc(a.effect)}</span><span class="note">Message ${esc(id)} · first recorded ${esc(fmt('t', a.first))}</span></div><div class="small" style="margin-top:2px">${esc(a.message || a.header)}</div></div>`).join('')}</div>` : '<p class="muted small">None recorded.</p>'}</div>`
+    : '<p class="muted gap">Loading this day…</p>'}
+    <div class="panel gap"><h2>Every recorded day</h2>${otp.length > 1 ? `<div class="trend small">On time by day${spark(otp.map(x => 100 * x.onTime), 'var(--good)', 40)}</div>` : ''}
+      ${table('hdays', [...days].reverse(), trendCols, { attrs: x => `data-act="hday" data-id="${esc(x.date)}"${x.date === date ? ' class="sel"' : ''}` })}</div>`;
+}
+
 // ---------- tabs ----------
-const TABS = [['map', 'Map'], ['buses', 'Buses'], ['stops', 'Stops & departures'], ['routes', 'Routes'], ['alerts', 'Alerts'], ['predictions', 'Predictions'], ['schedule', 'Schedule'], ['signs', 'Signs'], ['system', 'System'], ['explorer', 'API explorer']];
-const RENDER = { map: renderMapPanel, buses: renderBuses, stops: renderStops, routes: renderRoutes, alerts: renderAlerts, predictions: renderPredictions, schedule: renderSchedule, signs: renderSigns, system: renderSystem, explorer: renderExplorer };
+const TABS = [['map', 'Map'], ['buses', 'Buses'], ['stops', 'Stops & departures'], ['routes', 'Routes'], ['alerts', 'Alerts'], ['history', 'History'], ['predictions', 'Predictions'], ['schedule', 'Schedule'], ['signs', 'Signs'], ['system', 'System'], ['explorer', 'API explorer']];
+const RENDER = { map: renderMapPanel, buses: renderBuses, stops: renderStops, routes: renderRoutes, alerts: renderAlerts, history: renderHistory, predictions: renderPredictions, schedule: renderSchedule, signs: renderSigns, system: renderSystem, explorer: renderExplorer };
 function buildNav() {
   $('#tabs').innerHTML = TABS.map(([id, label]) => `<button type="button" role="tab" id="tb-${id}" data-act="tab" data-id="${id}" aria-controls="tab-${id}" aria-selected="false">${esc(label)}<span class="tc" id="tc-${id}"></span></button>`).join('');
 }
@@ -1481,6 +1643,7 @@ function showTab(id) {
   if (id === 'map') setTimeout(() => map.invalidateSize(), 0);
   if (id === 'stops') { P.stopBoard?.run(true); P.stopPast?.run(true); if (Date.now() - S.depsAt > 90000) P.allDepartures?.run(true); }
   if (id === 'signs') P.signs?.run(true);
+  if (id === 'history') P.history?.run(true);
   if (id === 'routes') loadDirections();
 }
 function rerender(tabs) {
@@ -1572,6 +1735,8 @@ document.addEventListener('click', e => {
     case 'nearest': nearest(); break;
     case 'tu': S.tuSel = id; renderTab(); break;
     case 'exrun': runExplorer(); break;
+    case 'hblock': S.hist.block = id; renderTab(); break;
+    case 'hday': selectHistoryDay(id); break;
   }
 });
 document.addEventListener('keydown', e => {
@@ -1599,6 +1764,7 @@ document.addEventListener('change', e => {
     if (m && S.stopById.has(Number(m[1]))) { S.stopQ = ''; t.blur(); selectStop(Number(m[1])); }
   } else if (t.id === 'gfile') { S.gtfsFile = t.value; renderTab(); }
   else if (t.id === 'exsel') { S.explorer.key = t.value; S.explorer.result = null; t.blur(); renderTab(); }
+  else if (t.id === 'hday') { t.blur(); selectHistoryDay(t.value); }
 });
 
 // ---------- live status line ----------
@@ -1631,6 +1797,7 @@ async function boot() {
   poller('stopBoard', 20000, pollBoard, () => S.tab === 'stops' && !!S.stop);
   poller('stopPast', 60000, pollPast, () => S.tab === 'stops' && !!S.stop);
   poller('signs', 30000, pollSigns, () => S.tab === 'signs');
+  poller('history', 600000, loadHistory, () => S.tab === 'history');
   const st = poller('static', 1800000, async () => { await loadStatic(); afterStatic(); });
   // The first load runs even in a hidden tab, so the page is filled in when someone opens it.
   for (const p of Object.values(P)) if (p !== st) p.run(true);
