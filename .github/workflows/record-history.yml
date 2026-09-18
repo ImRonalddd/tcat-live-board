@@ -4,7 +4,7 @@ name: Record TCAT history
 # so this records a snapshot every 10 minutes into the data branch.
 on:
   schedule:
-    - cron: "4-59/10 * * * *"
+    - cron: "4,14,24,34,44,54 * * * *"
   workflow_dispatch:
 
 permissions:
